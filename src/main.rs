@@ -26,6 +26,8 @@ use isideload::sideload::builder::{ExtensionsBehavior, ExtensionsBehaviorSelecti
 use isideload::sideload::TeamSelection;
 use isideload::util::callbacks::ExtensionsBehaviorCallbackBox;
 use isideload::util::fs_storage::FsStorage;
+use isideload::util::device::IdeviceInfo;
+use isideload::dev::devices::DevicesApi;
 use serde::{Deserialize, Serialize};
 
 const LABEL: &str = "pi-sideload";
@@ -318,17 +320,48 @@ async fn install(a: &Args) -> Res<()> {
         .build();
 
     let progress = None::<fn(f32) -> std::future::Ready<()>>;
-    let result = if a.usb {
+    if a.usb {
         let mut mux = UsbmuxdConnection::default().await.map_err(fail("usbmuxd"))?;
         let dev = mux.get_devices().await.map_err(fail("list devices"))?.into_iter().next().ok_or("no iPhone on USB")?;
         let p = dev.to_provider(UsbmuxdAddr::from_env_var().map_err(fail("usbmuxd address"))?, LABEL);
-        sideloader.install_app(&p, ipa, false, progress, None).await
+        sideloader.install_app(&p, ipa, false, progress, None).await.map_err(|e| format!("install failed: {e}"))?;
     } else {
+        // Over Wi-Fi: sign once, then copy + install, retrying a dropped connection (the phone's Wi-Fi naps).
         let p = wifi_provider(a)?;
         println!("Installing on {}", device_summary(&p, &p.pairing_file).await?);
-        sideloader.install_app(&p, ipa, false, progress, None).await
-    };
-    result.map_err(|e| format!("install failed: {e}"))?;
+        let info = IdeviceInfo::from_device(&p).await.map_err(|e| format!("device info: {e}"))?;
+        let team = sideloader.get_team().await.map_err(|e| format!("team: {e}"))?;
+        sideloader
+            .get_dev_session()
+            .ensure_device_registered(&team, &info.name, &info.udid, None)
+            .await
+            .map_err(|e| format!("register device: {e}"))?;
+        let (signed, _) = sideloader
+            .sign_app(ipa, Some(team), false, progress, None, Some(&info.udid))
+            .await
+            .map_err(|e| format!("signing failed: {e}"))?;
+        let mut last = String::new();
+        for attempt in 1..=4 {
+            println!("Copying to the iPhone (try {attempt})…");
+            let fresh = wifi_provider(a)?; // a new connection each time
+            match isideload::sideload::install::install_app(&fresh, &signed, |pct| {
+                if pct % 20 == 0 { println!("  {pct}%"); }
+            })
+            .await
+            {
+                Ok(()) => { last.clear(); break; }
+                Err(e) => {
+                    last = format!("{e:?}");
+                    eprintln!("try {attempt} failed: {last}");
+                    tokio::time::sleep(std::time::Duration::from_secs(5 * attempt)).await;
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&signed);
+        if !last.is_empty() {
+            return Err(format!("install failed after 4 tries: {last}"));
+        }
+    }
     println!("Installed.");
     Ok(())
 }
