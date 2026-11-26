@@ -88,6 +88,13 @@ def latest_release(cfg):
     return {"tag": rel["tag_name"], "number": int(m.group(1)) if m else 0, "url": asset["browser_download_url"]}
 
 
+def summarize(stderr):
+    """isideload errors are a tree of "● message" lines with source paths under them: keep the messages."""
+    msgs = [l.strip(" │├╰●").strip() for l in stderr.splitlines() if "●" in l or l.startswith("error:")]
+    msgs = [m.removeprefix("error:").strip().rstrip(":") for m in msgs]
+    return ": ".join(m for m in msgs if m) or "unknown error"
+
+
 def find_iphone(cfg):
     if cfg.get("iphone_host"):
         return cfg["iphone_host"]
@@ -128,15 +135,16 @@ def run(cfg, state, force=False):
     host = find_iphone(cfg)
     if not host:
         return failed("iPhone not found on the Wi-Fi")
+    log(f"iPhone at {host}")
     ipa = os.path.join(DIR, cfg["asset"])
     log(f"{reason}: downloading {rel['tag']}")
     urllib.request.urlretrieve(rel["url"], ipa)
+    env = {**os.environ, **({"PI_SIDELOAD_DEBUG": "1"} if "--debug" in sys.argv else {})}
     p = subprocess.run([BIN, "install", ipa, "--host", host, "--dir", DIR, "--extensions", cfg["extensions"]],
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=900)
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=900, env=env)
     log(p.stdout.strip() + ("\n" + p.stderr.strip() if p.stderr.strip() else ""))
     if p.returncode != 0:
-        err = (p.stderr.strip().splitlines() or ["unknown error"])[-1].removeprefix("error: ")
-        return failed(err[:300])
+        return failed(summarize(p.stderr)[:300])
     state.update(build=rel["number"], tag=rel["tag"], last_install=now, last_error=None, last_failure_message=0)
     what = f"{rel['tag']} installed" if newer else f"re-signed ({rel['tag']})"
     notify(cfg, f"✅ {cfg['app_name']} {what}. Good until {time.strftime('%a %d %b', time.localtime(now + 7 * DAY))}.")
