@@ -12,7 +12,11 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use idevice::IdeviceService;
+use idevice::{IdeviceService, RemoteXpcClient};
+use idevice::core_device_proxy::CoreDeviceProxy;
+use idevice::remote_pairing::{RemotePairingClient, RpPairingFile, RpPairingSocket, connect_tls_psk_tunnel_native};
+use idevice::rsd::RsdHandshake;
+use idevice::tcp::handle::AdapterHandle;
 use idevice::lockdown::LockdownClient;
 use idevice::pairing_file::PairingFile;
 use idevice::provider::{IdeviceProvider, TcpProvider};
@@ -52,6 +56,7 @@ struct Args {
     usb: bool,
     extensions: String,
     out: Option<PathBuf>,
+    rp_port: Option<u16>,
 }
 
 fn parse_args() -> Args {
@@ -64,6 +69,7 @@ fn parse_args() -> Args {
         usb: false,
         extensions: "register".into(),
         out: None,
+        rp_port: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -73,6 +79,7 @@ fn parse_args() -> Args {
             "--usb" => a.usb = true,
             "--extensions" => a.extensions = it.next().unwrap_or_default(),
             "--out" => a.out = it.next().map(PathBuf::from),
+            "--rp-port" => a.rp_port = it.next().and_then(|p| p.parse().ok()),
             "-h" | "--help" => a.cmd = "help".into(),
             _ if a.cmd.is_empty() => a.cmd = arg,
             _ => a.positional.push(arg),
@@ -109,8 +116,8 @@ const HELP: &str = "pi-sideload: sign and install an .ipa over Wi-Fi with a free
 
   pi-sideload login
   pi-sideload pair [--out pairing.plist]          (iPhone plugged in by USB, unlocked)
-  pi-sideload check --host <iphone-ip>
-  pi-sideload install <app.ipa> --host <iphone-ip> [--usb] [--extensions register|reuse]
+  pi-sideload check --host <iphone-ip> [--rp-port <port>]
+  pi-sideload install <app.ipa> --host <iphone-ip> --rp-port <port> [--usb] [--extensions register|reuse]
 
 Options: --dir <folder> (default ~/.pi-sideload). PI_SIDELOAD_DEBUG=1 for more logs.";
 
@@ -246,7 +253,60 @@ async fn pair(a: &Args) -> Res<()> {
     let out = pairing_path(a);
     write_private(&out, &pairing.serialize().map_err(fail("pairing file"))?)?;
     println!("Paired with {} ({}). Wrote {}", name.unwrap_or_else(|| "iPhone".into()), dev.udid, out.display());
+
+    // iOS 17+ only lets apps be copied over Wi-Fi through a remote-pairing tunnel (what Xcode uses), so pair for that too.
+    println!("Making the Wi-Fi tunnel pairing (tap Trust on the iPhone if it asks)…");
+    let rp = rp_pair_usb(&provider).await?;
+    let rp_out = out.with_file_name("rppairing.plist");
+    write_private(&rp_out, &rp.to_bytes())?;
+    println!("Wrote {}", rp_out.display());
     Ok(())
+}
+
+async fn rp_pair_usb(provider: &dyn IdeviceProvider) -> Res<RpPairingFile> {
+    let proxy = CoreDeviceProxy::connect(provider).await.map_err(fail("CoreDeviceProxy (Developer Mode on?)"))?;
+    let rsd_port = proxy.tunnel_info().server_rsd_port;
+    let mut adapter = proxy.create_software_tunnel().map_err(fail("tunnel"))?.to_async_handle();
+    let rsd = adapter.connect(rsd_port).await.map_err(fail("RSD connect"))?;
+    let handshake = RsdHandshake::new(rsd).await.map_err(fail("RSD handshake"))?;
+    let ts = handshake
+        .services
+        .get("com.apple.internal.dt.coredevice.untrusted.tunnelservice")
+        .ok_or("the iPhone has no tunnel service")?;
+    let stream = adapter.connect(ts.port).await.map_err(fail("tunnel service"))?;
+    let mut conn = RemoteXpcClient::new(stream).await.map_err(fail("XPC"))?;
+    conn.do_handshake().await.map_err(fail("XPC handshake"))?;
+    let _ = conn.recv_root().await;
+    let mut rpf = RpPairingFile::generate(LABEL);
+    let mut rpc = RemotePairingClient::new(conn, LABEL);
+    rpc.connect(&mut rpf, async || "000000".to_string()).await.map_err(|e| format!("remote pairing: {e:?}"))?;
+    Ok(rpf)
+}
+
+/// Opens the Wi-Fi tunnel with rppairing.plist: remote pairing on `rp_port`, then TLS-PSK + CDTunnel, then RSD.
+async fn wifi_tunnel(a: &Args) -> Res<(AdapterHandle, RsdHandshake)> {
+    let host: IpAddr = a.host.as_deref().ok_or("--host is required")?.parse().map_err(|_| "bad --host")?;
+    let port = a.rp_port.ok_or("--rp-port is required (the iPhone's _remotepairing._tcp port)")?;
+    let path = pairing_path(a).with_file_name("rppairing.plist");
+    let bytes = std::fs::read(&path).map_err(|_| format!("no {}: re-run `pi-sideload pair` with the iPhone on USB", path.display()))?;
+    let mut rpf = RpPairingFile::from_bytes(&bytes).map_err(fail("rppairing.plist"))?;
+    let addr = std::net::SocketAddr::new(host, port);
+    let stream = tokio::net::TcpStream::connect(addr).await.map_err(fail("can't reach the iPhone's pairing port"))?;
+    let mut rpc = RemotePairingClient::new(RpPairingSocket::new(stream), LABEL);
+    rpc.connect(&mut rpf, async || "000000".to_string()).await.map_err(|e| format!("Wi-Fi pairing rejected: {e:?}"))?;
+    let tunnel_port = rpc.create_tcp_listener().await.map_err(fail("tunnel listener"))?;
+    let ts = tokio::net::TcpStream::connect(std::net::SocketAddr::new(host, tunnel_port)).await.map_err(fail("tunnel connect"))?;
+    let tunnel = connect_tls_psk_tunnel_native(ts, rpc.encryption_key()).await.map_err(fail("tunnel TLS"))?;
+    let client_ip: IpAddr = tunnel.info.client_address.parse().map_err(fail("tunnel address"))?;
+    let server_ip: IpAddr = tunnel.info.server_address.parse().map_err(fail("tunnel address"))?;
+    let mtu = tunnel.info.mtu as usize;
+    let rsd_port = tunnel.info.server_rsd_port;
+    let mut adapter = idevice::tcp::adapter::Adapter::new(Box::new(tunnel.into_inner()), client_ip, server_ip);
+    adapter.set_mss(mtu.min(8192) - 60);
+    let mut adapter = adapter.to_async_handle();
+    let rsd = adapter.connect(rsd_port).await.map_err(fail("RSD connect"))?;
+    let handshake = RsdHandshake::new(rsd).await.map_err(fail("RSD handshake"))?;
+    Ok((adapter, handshake))
 }
 
 fn wifi_provider(a: &Args) -> Res<TcpProvider> {
@@ -270,6 +330,10 @@ async fn device_summary(p: &dyn IdeviceProvider, pairing: &PairingFile) -> Res<S
 async fn check(a: &Args) -> Res<()> {
     let p = wifi_provider(a)?;
     println!("Reached {}", device_summary(&p, &p.pairing_file).await?);
+    if a.rp_port.is_some() {
+        let (_, hs) = wifi_tunnel(a).await?;
+        println!("Wi-Fi tunnel works ({} services)", hs.services.len());
+    }
     Ok(())
 }
 
@@ -341,18 +405,21 @@ async fn install(a: &Args) -> Res<()> {
             .await
             .map_err(|e| format!("signing failed: {e}"))?;
         let mut last = String::new();
-        for attempt in 1..=4 {
-            println!("Copying to the iPhone (try {attempt})…");
-            let fresh = wifi_provider(a)?; // a new connection each time
-            match isideload::sideload::install::install_app(&fresh, &signed, |pct| {
-                if pct % 20 == 0 { println!("  {pct}%"); }
-            })
-            .await
-            {
+        for attempt in 1..=3u64 {
+            println!("Copying to the iPhone over the Wi-Fi tunnel (try {attempt})…");
+            let res = match wifi_tunnel(a).await {
+                Ok((mut adapter, mut hs)) => isideload::sideload::install::install_app_rsd(&mut adapter, &mut hs, &signed, |pct| {
+                    if pct % 20 == 0 { println!("  {pct}%"); }
+                })
+                .await
+                .map_err(|e| format!("{e:?}")),
+                Err(e) => Err(e),
+            };
+            match res {
                 Ok(()) => { last.clear(); break; }
                 Err(e) => {
-                    last = format!("{e:?}");
-                    eprintln!("try {attempt} failed: {last}");
+                    eprintln!("try {attempt} failed: {e}");
+                    last = e;
                     tokio::time::sleep(std::time::Duration::from_secs(5 * attempt)).await;
                 }
             }

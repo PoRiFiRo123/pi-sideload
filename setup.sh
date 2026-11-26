@@ -34,7 +34,7 @@ if [[ $mode == pair ]]; then
   say "Pairing with the iPhone on USB (unlock it; tap Trust if asked)"
   "$BIN" pair --dir "$DIR"
   say "Now copy the pairing file to the always-on Pi, for example:"
-  echo "  ssh admin@frame.local 'mkdir -p ~/.pi-sideload' && scp $DIR/pairing.plist admin@frame.local:~/.pi-sideload/"
+  echo "  ssh admin@frame.local 'mkdir -p ~/.pi-sideload' && scp $DIR/pairing.plist $DIR/rppairing.plist admin@frame.local:~/.pi-sideload/"
   exit 0
 fi
 
@@ -77,11 +77,11 @@ if ! crontab -l 2>/dev/null | grep -qF "$DIR/auto.py"; then
   say "Added the cron job (every 2 hours)"
 fi
 
-if [[ ! -f $DIR/pairing.plist ]]; then
+if [[ ! -f $DIR/pairing.plist || ! -f $DIR/rppairing.plist ]]; then
   say "Last step: the pairing file"
   echo "On the computer the iPhone is plugged into, run:"
   echo "  curl -fsSL https://raw.githubusercontent.com/$REPO/main/setup.sh | bash -s pair"
-  echo "and copy pairing.plist here to $DIR/. Then test with:"
+  echo "and copy pairing.plist and rppairing.plist here to $DIR/. Then test with:"
 else
   say "All set. Test it now:"
 fi

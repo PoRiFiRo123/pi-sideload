@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 isideload = { version = "0.5.2", default-features = false, features = ["install", "fs-storage", "tokio-mt"] }
-idevice = { version = "0.1.61", default-features = false, features = ["usbmuxd", "tcp", "ring", "rustls"] }
+idevice = { version = "0.1.61", default-features = false, features = ["usbmuxd", "tcp", "ring", "rustls", "core_device_proxy", "tunnel_tcp_stack", "remote_pairing", "rsd", "xpc"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "time"] }
 tracing = "0.1"

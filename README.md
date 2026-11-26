@@ -15,7 +15,7 @@ It takes no app slot on the phone: the signing happens on the Pi. Built on [isid
 1. **On the computer the iPhone is plugged into** (unlocked, trusted, Developer Mode on):
    ```bash
    curl -fsSL https://raw.githubusercontent.com/PoRiFiRo123/pi-sideload/main/setup.sh | bash -s pair
-   ssh admin@frame.local 'mkdir -p ~/.pi-sideload' && scp ~/.pi-sideload/pairing.plist admin@frame.local:~/.pi-sideload/
+   ssh admin@frame.local 'mkdir -p ~/.pi-sideload' && scp ~/.pi-sideload/pairing.plist ~/.pi-sideload/rppairing.plist admin@frame.local:~/.pi-sideload/
    ```
 2. **On the always-on Pi** (64-bit Raspberry Pi OS):
    ```bash
@@ -32,7 +32,7 @@ It takes no app slot on the phone: the signing happens on the Pi. Built on [isid
 | `config.json` | repo, asset, `iphone_host` (blank = find it with avahi), `refresh_days`, Telegram/Discord |
 | `account.json` | Apple ID and password, for unattended sign-in |
 | `storage/` | the Pi's Apple "device" identity (so 2FA isn't asked again) and the signing certificate |
-| `pairing.plist` | lets the Pi talk to the iPhone over Wi-Fi. Re-make it after resetting or restoring the phone |
+| `pairing.plist`, `rppairing.plist` | let the Pi talk to the iPhone over Wi-Fi (lockdown, and the iOS 17+ remote-pairing tunnel that app installs need). Re-make them after resetting or restoring the phone |
 | `state.json`, `auto.log` | what's installed, and what happened |
 
 ## Commands

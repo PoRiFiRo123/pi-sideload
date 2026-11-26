@@ -29,6 +29,7 @@ DEFAULTS = {
     "asset": "PaisaPulse.ipa",           # file name in each release
     "app_name": "Paisa Pulse",
     "iphone_host": "",                   # the iPhone's IP; empty = find it on the network (avahi)
+    "iphone_rp_port": 0,                 # its _remotepairing._tcp port; 0 = find it (it can change)
     "refresh_days": 5,                   # re-sign when the last install is this old (free certs last 7 days)
     "extensions": "register",            # register: widget + share extension get their own App IDs
     "telegram_bot_token": "", "telegram_chat_id": "", "discord_webhook": "",
@@ -95,19 +96,26 @@ def summarize(stderr):
     return ": ".join(m for m in msgs if m) or "unknown error"
 
 
-def find_iphone(cfg):
-    if cfg.get("iphone_host"):
-        return cfg["iphone_host"]
-    # iPhones with Wi-Fi access on announce _apple-mobdev2._tcp. Needs avahi-utils.
+def browse(service):
+    """[(ip, port)] for an mDNS service (avahi-utils), IPv4 only."""
     try:
-        out = subprocess.run(["avahi-browse", "-rpt", "_apple-mobdev2._tcp"], capture_output=True, text=True, timeout=20).stdout
+        out = subprocess.run(["avahi-browse", "-rpt", service], capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return []
+    found = []
     for line in out.splitlines():
         parts = line.split(";")
-        if parts[0] == "=" and len(parts) > 7 and parts[2] == "IPv4":
-            return parts[7]
-    return None
+        if parts[0] == "=" and len(parts) > 8 and parts[2] == "IPv4":
+            found.append((parts[7], int(parts[8])))
+    return found
+
+
+def find_iphone(cfg):
+    """(ip, remote-pairing port) or (None, None). iOS 17+ copies apps over Wi-Fi only through the remote-pairing tunnel."""
+    rp = browse("_remotepairing._tcp")
+    host = cfg.get("iphone_host") or next((ip for ip, _ in browse("_apple-mobdev2._tcp")), None) or (rp[0][0] if rp else None)
+    port = cfg.get("iphone_rp_port") or next((p for ip, p in rp if ip == host), None)
+    return host, port
 
 
 def run(cfg, state, force=False):
@@ -132,15 +140,17 @@ def run(cfg, state, force=False):
             state["last_failure_message"] = now
         log(f"failed: {msg}")
 
-    host = find_iphone(cfg)
+    host, rp_port = find_iphone(cfg)
     if not host:
         return failed("iPhone not found on the Wi-Fi")
-    log(f"iPhone at {host}")
+    if not rp_port:
+        return failed("found the iPhone but not its pairing port (_remotepairing._tcp); is it unlocked with Developer Mode on?")
+    log(f"iPhone at {host}, pairing port {rp_port}")
     ipa = os.path.join(DIR, cfg["asset"])
     log(f"{reason}: downloading {rel['tag']}")
     urllib.request.urlretrieve(rel["url"], ipa)
     env = {**os.environ, **({"PI_SIDELOAD_DEBUG": "1"} if "--debug" in sys.argv else {})}
-    p = subprocess.run([BIN, "install", ipa, "--host", host, "--dir", DIR, "--extensions", cfg["extensions"]],
+    p = subprocess.run([BIN, "install", ipa, "--host", host, "--rp-port", str(rp_port), "--dir", DIR, "--extensions", cfg["extensions"]],
                        capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=900, env=env)
     log(p.stdout.strip() + ("\n" + p.stderr.strip() if p.stderr.strip() else ""))
     if p.returncode != 0:
