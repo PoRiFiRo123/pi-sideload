@@ -1,0 +1,36 @@
+name: Build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            asset: pi-sideload-linux-arm64
+          - runner: ubuntu-24.04
+            asset: pi-sideload-linux-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: cp target/release/pi-sideload ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v4
+        with: { name: "${{ matrix.asset }}", path: "${{ matrix.asset }}" }
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { merge-multiple: true }
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v0.1.${{ github.run_number }}"
+          gh release create "$tag" pi-sideload-linux-arm64 pi-sideload-linux-x64 --repo "${{ github.repository }}" --title "$tag" --notes "Built from ${{ github.sha }}" --latest
